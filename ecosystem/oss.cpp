@@ -320,6 +320,87 @@ static bool get_resp_crc64(HTTP_STACK_OP& op, uint64_t* crc64) {
   return estring_view(it.second()).to_uint64_check(crc64);
 }
 
+// ---------------------------------------------------------------------------
+// SSE protocol helpers
+// ---------------------------------------------------------------------------
+static constexpr std::string_view kHeaderSSE = "x-oss-server-side-encryption";
+static constexpr std::string_view kHeaderSSEKMSKeyId =
+    "x-oss-server-side-encryption-key-id";
+static constexpr std::string_view kHeaderSSEDataAlgorithm =
+    "x-oss-server-side-data-encryption";
+static constexpr std::string_view kHeaderRequestId = "x-oss-request-id";
+
+void add_sse_headers(photon::net::http::Headers& headers,
+                     const SseOptions& sse) {
+  if (sse.algorithm.empty()) return;
+  headers.insert(kHeaderSSE, sse.algorithm);
+  if (!sse.kms_key_id.empty()) {
+    headers.insert(kHeaderSSEKMSKeyId, sse.kms_key_id);
+  }
+}
+
+void parse_sse_response(const photon::net::http::Headers& headers,
+                        SseResponse* out) {
+  if (!out) return;
+  *out = SseResponse{};
+  auto it = headers.find(kHeaderSSE);
+  if (it != headers.end()) out->algorithm = std::string(it.second());
+  it = headers.find(kHeaderSSEKMSKeyId);
+  if (it != headers.end()) out->kms_key_id = std::string(it.second());
+  it = headers.find(kHeaderSSEDataAlgorithm);
+  if (it != headers.end()) out->data_algorithm = std::string(it.second());
+  it = headers.find(kHeaderRequestId);
+  if (it != headers.end()) out->request_id = std::string(it.second());
+}
+
+SseVerification verify_sse_response(const SseOptions& expected,
+                                    bool require_kms_key_id,
+                                    SseResponse* observed) {
+  if (expected.algorithm.empty()) {
+    if (observed) observed->verification = SseVerification::NotRequested;
+    return SseVerification::NotRequested;
+  }
+  auto result = SseVerification::Matched;
+  if (!observed || !observed->algorithm.has_value()) {
+    result = SseVerification::Missing;
+  } else if (*observed->algorithm != expected.algorithm) {
+    result = SseVerification::Mismatch;
+  } else if (!expected.kms_key_id.empty()) {
+    if (!observed->kms_key_id.has_value()) {
+      // A missing key-id echo at Init time is tolerated; final write
+      // responses must echo the requested key id exactly.
+      result = require_kms_key_id ? SseVerification::Missing
+                                  : SseVerification::Matched;
+    } else if (*observed->kms_key_id != expected.kms_key_id) {
+      result = SseVerification::Mismatch;
+    }
+  }
+  if (observed) observed->verification = result;
+  return result;
+}
+
+// Parse and verify the SSE outcome of a successful write response.
+// Returns 0 when verification passed (or no policy was attached); on
+// Missing/Mismatch it fills the verification field and returns -1/EIO.
+static int verify_sse_outcome(HTTP_STACK_OP& op, std::string_view object,
+                              const SseOptions& expected,
+                              bool require_kms_key_id,
+                              SseResponse* sse_response) {
+  if (!sse_response) return 0;
+  parse_sse_response(op.resp.headers, sse_response);
+  auto v = verify_sse_response(expected, require_kms_key_id, sse_response);
+  if (v == SseVerification::Missing || v == SseVerification::Mismatch) {
+    LOG_ERROR_RETURN(
+        EIO, -1,
+        "SSE verification failed on object `: expected `, observed `, "
+        "request-id `",
+        object, expected.algorithm,
+        sse_response->algorithm.has_value() ? *sse_response->algorithm : "<none>",
+        sse_response->request_id);
+  }
+  return 0;
+}
+
 static ssize_t body_writer_cb(void* iov_view, photon::net::http::Request* req) {
   auto view = static_cast<iovector_view*>(iov_view);
   auto ret = req->writev(view->iov, view->iovcnt);
@@ -378,7 +459,8 @@ class OssClientImpl : public Client {
   int copy_object(std::string_view src_object, std::string_view dst_object,
                   ObjectCopyOptions& opts);
 
-  int init_multipart_upload(std::string_view object, void** context);
+  int init_multipart_upload(std::string_view object, void** context,
+                            MultipartUploadOptions& opts);
 
   ssize_t upload_part(void* context, size_t cnt,
                       int part_number, BodyWriter writer,
@@ -713,6 +795,7 @@ int OssClient::do_list_objects_v1(std::string_view bucket,
 
 int OssClient::do_copy_object(OssUrl& src_oss_url, OssUrl& dst_oss_url,
                               ObjectCopyOptions& opts) {
+  if (opts.sse_response) *opts.sse_response = SseResponse{};
   DEFINE_ONSTACK_OP(m_client, Verb::PUT, dst_oss_url.url());
 
   estring oss_copy_source =
@@ -721,6 +804,11 @@ int OssClient::do_copy_object(OssUrl& src_oss_url, OssUrl& dst_oss_url,
   if (!opts.overwrite) {
     op.req.headers.insert(OSS_HEADER_KEY_X_OSS_FORBID_OVERWRITE, "true");
   }
+  if (!opts.source_if_match.empty()) {
+    op.req.headers.insert("x-oss-copy-source-if-match", opts.source_if_match);
+  }
+  // SSE creation headers are added before signing.
+  if (opts.sse) add_sse_headers(op.req.headers, *opts.sse);
 
   std::string_view dst_type{};  // use the same content type as the source
   if (opts.set_mime) {
@@ -735,6 +823,31 @@ int OssClient::do_copy_object(OssUrl& src_oss_url, OssUrl& dst_oss_url,
 
   opts.crc64.reset();
   int r = sign_and_call(op, Verb::PUT, dst_oss_url);
+  if (r < 0) return r;
+
+  // A successful CopyObject returns a CopyObjectResult XML body. Reject an
+  // embedded Error document (HTTP 200 does not always mean success).
+  auto reader = get_xml_node(op);
+  if (!reader) LOG_ERROR_RETURN(EINVAL, -1, "failed to parse xml resp_body");
+  if (!reader["CopyObjectResult"]) {
+    auto err_node = reader["Error"];
+    if (err_node) {
+      LOG_ERROR_RETURN(EIO, -1,
+                       "copy object failed with embedded error: Code[`], "
+                       "Message[`], request-id[`]",
+                       err_node["Code"].to_string_view(),
+                       err_node["Message"].to_string_view(),
+                       op.resp.headers[kHeaderRequestId]);
+    }
+    LOG_ERROR_RETURN(EINVAL, -1, "unexpected copy response without "
+                                 "CopyObjectResult");
+  }
+
+  // Order: business XML -> SSE outcome -> CRC observation.
+  static const SseOptions kNoSse;
+  r = verify_sse_outcome(op, dst_oss_url.object(),
+                         opts.sse ? *opts.sse : kNoSse,
+                         true /*require_kms_key_id*/, opts.sse_response);
   if (r < 0) return r;
 
   uint64_t crc64;
@@ -944,6 +1057,11 @@ int OssClient::fill_meta(HTTP_STACK_OP& op, ObjectHeaderMeta& meta) {
   if (it != op.resp.headers.end()) {
     meta.set_crc64(estring_view(it.second()).to_uint64());
   }
+
+  // HEAD also carries the object's SSE attributes (algorithm / key id /
+  // data-encryption); parse them so the adapter layer can make copy policy
+  // decisions without inferring from cached stat data.
+  parse_sse_response(op.resp.headers, &meta.sse);
   return 0;
 }
 
@@ -1548,10 +1666,13 @@ ssize_t OssClient::put_object(std::string_view object, size_t cnt,
   auto oss_url = make_oss_url(object);
   auto content_type = lookup_mime_type(object);
 
+  if (opts.sse_response) *opts.sse_response = SseResponse{};
   DEFINE_ONSTACK_OP(m_client, Verb::PUT, oss_url.url());
   if (!content_type.empty()) {
     op.req.headers.insert(OSS_HEADER_KEY_CONTENT_TYPE, content_type);
   }
+  // SSE creation headers are added before signing.
+  if (opts.sse) add_sse_headers(op.req.headers, *opts.sse);
   op.req.headers.content_length(cnt);
   auto body_writer_wrapper = [&writer, cnt](photon::net::http::Request* req) -> ssize_t {
     ssize_t n = writer(req);
@@ -1563,6 +1684,12 @@ ssize_t OssClient::put_object(std::string_view object, size_t cnt,
   op.body_writer = body_writer_wrapper;
   int r = sign_and_call(op, Verb::PUT, oss_url);
   if (r < 0) return r;
+  // Order: business success -> SSE outcome -> data CRC -> publish ETag.
+  static const SseOptions kNoSse;
+  r = verify_sse_outcome(op, oss_url.object(),
+                         opts.sse ? *opts.sse : kNoSse,
+                         true /*require_kms_key_id*/, opts.sse_response);
+  if (r < 0) return r;
   r = verify_crc64_if_needed(op, oss_url.object(), opts.expected_crc64);
   if (r < 0) return r;
   fill_upload_response(op, opts);
@@ -1572,6 +1699,10 @@ ssize_t OssClient::put_object(std::string_view object, size_t cnt,
 ssize_t OssClient::append_object(std::string_view object,
                                  const struct iovec* iov, int iovcnt,
                                  off_t position, ObjectUploadOptions& opts) {
+  // AppendObject does not accept SSE creation headers; the adapter layer
+  // rejects explicit SSE configurations before reaching this path.
+  if (opts.sse)
+    LOG_ERROR_RETURN(EINVAL, -1, "SSE options are not allowed on AppendObject");
   iovector_view view((struct iovec*)iov, iovcnt);
   auto cnt = view.sum();
 
@@ -1613,20 +1744,28 @@ struct oss_multipart_context {
   std::string upload_id;
   std::vector<std::pair<int, std::string>> part_list;
   photon::spinlock lock;
+  // Effective SSE policy snapshot fixed at Init time. Owned by the context
+  // (value copy, never a borrowed reference); parts are read-only against
+  // it, Complete verifies the final response against it.
+  std::optional<SseOptions> sse;
 };
 
-int OssClient::init_multipart_upload(std::string_view object, void** context) {
+int OssClient::init_multipart_upload(std::string_view object, void** context,
+                                     MultipartUploadOptions& opts) {
   auto oss_url = make_oss_url(object);
 
   DEFINE_CONST_STATIC_ORDERED_STRING_KV(query_params,
                                         {// must appear in dictionary order!
                                          {OSS_PARAM_KEY_UPLOADS, ""}});
 
+  if (opts.sse_response) *opts.sse_response = SseResponse{};
   DEFINE_ONSTACK_OP(m_client, Verb::POST, oss_url.append_params(query_params));
 
   auto content_type = lookup_mime_type(object);
   if (!content_type.empty())
     op.req.headers.insert(OSS_HEADER_KEY_CONTENT_TYPE, content_type);
+  // SSE creation headers are added before signing.
+  if (opts.sse) add_sse_headers(op.req.headers, *opts.sse);
 
   int r = sign_and_call(op, Verb::POST, oss_url, query_params);
   if (r < 0) return r;
@@ -1637,9 +1776,35 @@ int OssClient::init_multipart_upload(std::string_view object, void** context) {
   if (!upload_id.has_value())
     LOG_ERROR_RETURN(EINVAL, -1, "invalid response with no upload id provided");
 
+  // Verify the Init response before delivering the context. The algorithm
+  // echo is mandatory; a key-id echo, when present, must match (the final
+  // Complete response is checked strictly). On failure the upload session
+  // is aborted best-effort and no context is handed out.
+  static const SseOptions kNoSse;
+  if (opts.sse_response) {
+    r = verify_sse_outcome(op, oss_url.object(),
+                           opts.sse ? *opts.sse : kNoSse,
+                           false /*require_kms_key_id*/, opts.sse_response);
+    if (r < 0) {
+      oss_multipart_context* tmp = new oss_multipart_context;
+      tmp->obj_path.appends(object);
+      tmp->upload_id = static_cast<estring_view>(upload_id);
+      std::string failed_upload_id = tmp->upload_id;
+      int abort_r = abort_multipart_upload(tmp);
+      if (abort_r < 0) {
+        LOG_WARN("failed to abort multipart upload ` on object ` after "
+                 "init verification failure",
+                 failed_upload_id, object);
+      }
+      errno = EIO;
+      return -1;
+    }
+  }
+
   oss_multipart_context* ctx = new oss_multipart_context;
   ctx->obj_path.appends(object);
   ctx->upload_id = static_cast<estring_view>(upload_id);
+  ctx->sse = opts.sse;
 
   *context = ctx;
   return 0;
@@ -1650,6 +1815,10 @@ ssize_t OssClient::upload_part(void* context, size_t cnt,
                                ObjectUploadOptions& opts) {
   assert(context);
 
+  // SSE headers on UploadPart are rejected by OSS (InvalidArgument); the
+  // object encryption is fixed at Init time.
+  if (opts.sse)
+    LOG_ERROR_RETURN(EINVAL, -1, "SSE options are not allowed on UploadPart");
   oss_multipart_context* ctx = (oss_multipart_context*)context;
   assert(!ctx->upload_id.empty());
 
@@ -1768,7 +1937,13 @@ int OssClient::complete_multipart_upload(void* context,
   iovector_view view(&iov, 1);
   auto oss_url = make_oss_url(ctx->obj_path);
 
+  // The effective SSE policy is the snapshot taken at Init time; the
+  // caller-provided opts.sse is never consulted here.
+  std::optional<SseOptions> sse_snapshot = ctx->sse;
+
   DEFER(delete ctx);
+
+  if (opts.sse_response) *opts.sse_response = SseResponse{};
 
   // must appear in dictionary order!
   DEFINE_ORDERED_STRING_KV(query_params,
@@ -1777,6 +1952,33 @@ int OssClient::complete_multipart_upload(void* context,
   op.req.headers.content_length(req_body.size());
   op.body_writer = {&view, &body_writer_cb};
   int r = sign_and_call(op, Verb::POST, oss_url, query_params);
+  if (r < 0) return r;
+
+  // A successful CompleteMultipartUpload returns an XML body; OSS may also
+  // answer HTTP 200 with an embedded Error document. Validate the business
+  // result before any SSE/CRC checks.
+  auto reader = get_xml_node(op);
+  if (!reader) LOG_ERROR_RETURN(EINVAL, -1, "failed to parse xml resp_body");
+  if (!reader["CompleteMultipartUploadResult"]) {
+    auto err_node = reader["Error"];
+    if (err_node) {
+      LOG_ERROR_RETURN(EIO, -1,
+                       "complete multipart upload failed with embedded error: "
+                       "Code[`], Message[`], request-id[`]",
+                       err_node["Code"].to_string_view(),
+                       err_node["Message"].to_string_view(),
+                       op.resp.headers[kHeaderRequestId]);
+    }
+    LOG_ERROR_RETURN(EINVAL, -1, "unexpected complete response without "
+                                 "CompleteMultipartUploadResult");
+  }
+
+  // Order: business XML -> SSE outcome (against the Init snapshot) -> data
+  // CRC -> publish ETag.
+  static const SseOptions kNoSse;
+  r = verify_sse_outcome(op, oss_url.object(),
+                         sse_snapshot ? *sse_snapshot : kNoSse,
+                         true /*require_kms_key_id*/, opts.sse_response);
   if (r < 0) return r;
   r = verify_crc64_if_needed(op, oss_url.object(), opts.expected_crc64);
   if (r < 0) return r;

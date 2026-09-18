@@ -26,6 +26,7 @@ limitations under the License.
 #include <photon/net/http/verb.h>
 #include <sys/uio.h>
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,6 +35,56 @@ namespace photon {
 namespace objstore {
 
 using StringKV = ordered_string_kv;
+
+// ---------------------------------------------------------------------------
+// Server-side encryption (SSE) request/response model
+//
+// SseOptions is the typed, per-request SSE policy. It is only honored by the
+// object-creation APIs (PutObject / InitiateMultipartUpload / CopyObject) and
+// is applied right before signing so the headers participate in the
+// signature. All other APIs reject a non-empty SseOptions input.
+struct SseOptions {
+  std::string algorithm;   // e.g. "AES256", "KMS"
+  std::string kms_key_id;  // optional CMK id for the KMS algorithm
+};
+
+// Outcome of verifying a successful write response against the effective
+// SSE policy.
+enum class SseVerification : uint8_t {
+  NotRequested = 0,  // no policy was attached to the request
+  Matched,           // response carries the requested algorithm (and key id)
+  Missing,           // required SSE fields are absent in the response
+  Mismatch,          // SSE fields differ from the requested policy
+};
+
+// SSE-related fields observed on a single response. All strings are copied
+// out of the HTTP header buffer; no string_view is retained.
+struct SseResponse {
+  std::optional<std::string> algorithm;
+  std::optional<std::string> kms_key_id;
+  // x-oss-server-side-data-encryption, e.g. AES256/SM4 for KMS objects.
+  std::optional<std::string> data_algorithm;
+  std::string request_id;
+  SseVerification verification = SseVerification::NotRequested;
+};
+
+// Append SSE creation headers for PutObject/InitiateMultipartUpload/
+// CopyObject. Must be called before signing.
+void add_sse_headers(photon::net::http::Headers& headers,
+                     const SseOptions& sse);
+
+// Extract SSE-related response headers into `out` (fully reset first).
+void parse_sse_response(const photon::net::http::Headers& headers,
+                        SseResponse* out);
+
+// Verify a successful write response against the effective policy.
+// `require_kms_key_id` is true for final write responses (Put/Copy/Complete):
+// when the policy carries a key id, the response must echo it exactly.
+// InitiateMultipartUpload passes false: a missing key-id echo is tolerated
+// there, but a present one must still match.
+SseVerification verify_sse_response(const SseOptions& expected,
+                                    bool require_kms_key_id,
+                                    SseResponse* observed);
 
 std::string_view lookup_mime_type(std::string_view name);
 
@@ -104,6 +155,10 @@ struct ObjectHeaderMeta : public ObjectMeta {
   DEFINE_OPTIONAL_FIELD(uint64_t, crc64, 1 << 5)
 
 #undef DEFINE_OPTIONAL_FIELD
+
+  // SSE attributes observed on HEAD. Independent field (not squeezed into
+  // the uint8 flags); only meaningful as a transient HEAD result.
+  SseResponse sse;
 };
 
 template <typename T>
@@ -131,6 +186,18 @@ struct ObjectCopyOptions {
   bool set_mime = false;
 
   OptValue<uint64_t> crc64;
+
+  // inputs
+  // Effective SSE policy for the destination object. OSS does not inherit
+  // SSE attributes from the copy source, so the caller must pass an explicit
+  // policy when encryption is expected.
+  std::optional<SseOptions> sse;
+  // Optional x-oss-copy-source-if-match constraint (source ETag), used to
+  // bind the HEAD-based policy decision to the copied content.
+  std::string source_if_match;
+
+  // outputs
+  SseResponse* sse_response = nullptr;
 };
 
 struct ObjectPartCopyOptions {
@@ -200,9 +267,25 @@ struct GetRangeParameters {
 struct ObjectUploadOptions {
   // inputs
   const uint64_t *expected_crc64 = nullptr;
+  // SSE creation policy. Only accepted by PutObject; UploadPart /
+  // AppendObject reject a non-empty value (multipart encryption is fixed at
+  // Init time and Complete uses the context snapshot).
+  std::optional<SseOptions> sse;
 
   // outputs
   std::string *etag = nullptr;
+  SseResponse *sse_response = nullptr;
+};
+
+// Options for InitiateMultipartUpload. The effective SSE policy is fixed at
+// Init time and snapshotted into the upload context; Complete verifies the
+// final response against that snapshot.
+struct MultipartUploadOptions {
+  // inputs
+  std::optional<SseOptions> sse;
+
+  // outputs
+  SseResponse *sse_response = nullptr;
 };
 
 // [WARNING] Retry-safety MUST be made sure. The framework re-calls from the 
@@ -329,8 +412,14 @@ class Client : public Object {
                           std::string_view dst_object,
                           ObjectCopyOptions& opts) = 0;
 
-  virtual int init_multipart_upload(std::string_view object,
-                                    void** context) = 0;
+  virtual int init_multipart_upload(std::string_view object, void** context,
+                                    MultipartUploadOptions& opts) = 0;
+
+  // Convenience overload: forwards with an empty policy.
+  int init_multipart_upload(std::string_view object, void** context) {
+    MultipartUploadOptions opts;
+    return init_multipart_upload(object, context, opts);
+  }
 
   // return value is the part size if the operation succeeds, otherwise
   // return -1.
