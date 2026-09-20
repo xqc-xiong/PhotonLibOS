@@ -26,7 +26,6 @@ limitations under the License.
 #include <photon/net/http/verb.h>
 #include <sys/uio.h>
 
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,6 +34,29 @@ namespace photon {
 namespace objstore {
 
 using StringKV = ordered_string_kv;
+
+// A simple optional-value holder used by the OSS object model. It predates
+// the SSE model below and must stay C++14-compatible: no std::optional, no
+// throwing accessors. Check has_value()/operator bool() before value().
+template <typename T>
+class OptValue {
+ public:
+  bool has_value() const { return has_value_; }
+  const T& value() const { return value_; }
+  void set(T v) {
+    value_ = std::move(v);
+    has_value_ = true;
+  }
+  void reset() {
+    value_ = {};
+    has_value_ = false;
+  }
+  explicit operator bool() const { return has_value_; }
+
+ private:
+  T value_{};
+  bool has_value_ = false;
+};
 
 // ---------------------------------------------------------------------------
 // Server-side encryption (SSE) request/response model
@@ -60,18 +82,20 @@ enum class SseVerification : uint8_t {
 // SSE-related fields observed on a single response. All strings are copied
 // out of the HTTP header buffer; no string_view is retained.
 struct SseResponse {
-  std::optional<std::string> algorithm;
-  std::optional<std::string> kms_key_id;
+  OptValue<std::string> algorithm;
+  OptValue<std::string> kms_key_id;
   // x-oss-server-side-data-encryption, e.g. AES256/SM4 for KMS objects.
-  std::optional<std::string> data_algorithm;
+  OptValue<std::string> data_algorithm;
   std::string request_id;
   SseVerification verification = SseVerification::NotRequested;
 };
 
 // Append SSE creation headers for PutObject/InitiateMultipartUpload/
-// CopyObject. Must be called before signing.
-void add_sse_headers(photon::net::http::Headers& headers,
-                     const SseOptions& sse);
+// CopyObject. Must be called before signing. Returns 0 on success; -1 with
+// errno set (EINVAL/EEXIST/ENOBUFS) when the headers cannot be added, in
+// which case the request MUST NOT be signed or sent.
+int add_sse_headers(photon::net::http::Headers& headers,
+                    const SseOptions& sse);
 
 // Extract SSE-related response headers into `out` (fully reset first).
 void parse_sse_response(const photon::net::http::Headers& headers,
@@ -161,26 +185,6 @@ struct ObjectHeaderMeta : public ObjectMeta {
   SseResponse sse;
 };
 
-template <typename T>
-class OptValue {
- public:
-  bool has_value() const { return has_value_; }
-  const T& value() const { return value_; }
-  void set(T v) {
-    value_ = std::move(v);
-    has_value_ = true;
-  }
-  void reset() {
-    value_ = {};
-    has_value_ = false;
-  }
-  explicit operator bool() const { return has_value_; }
-
- private:
-  T value_{};
-  bool has_value_ = false;
-};
-
 struct ObjectCopyOptions {
   bool overwrite = false;
   bool set_mime = false;
@@ -191,7 +195,7 @@ struct ObjectCopyOptions {
   // Effective SSE policy for the destination object. OSS does not inherit
   // SSE attributes from the copy source, so the caller must pass an explicit
   // policy when encryption is expected.
-  std::optional<SseOptions> sse;
+  OptValue<SseOptions> sse;
   // Optional x-oss-copy-source-if-match constraint (source ETag), used to
   // bind the HEAD-based policy decision to the copied content.
   std::string source_if_match;
@@ -267,13 +271,22 @@ struct GetRangeParameters {
 struct ObjectUploadOptions {
   // inputs
   const uint64_t *expected_crc64 = nullptr;
-  // SSE creation policy. Only accepted by PutObject; UploadPart /
-  // AppendObject reject a non-empty value (multipart encryption is fixed at
-  // Init time and Complete uses the context snapshot).
-  std::optional<SseOptions> sse;
 
   // outputs
   std::string *etag = nullptr;
+
+  // inputs (appended after the historical members so existing aggregate
+  // initializations like {&crc64, &etag} keep compiling)
+  // SSE creation policy. Only accepted by PutObject; UploadPart /
+  // AppendObject / CompleteMultipartUpload reject a present value (multipart
+  // encryption is fixed at Init time and Complete uses the context
+  // snapshot).
+  OptValue<SseOptions> sse;
+
+  // outputs
+  // Optional observation of the response SSE attributes. A nullptr does NOT
+  // disable verification when a policy is requested; it only means the
+  // caller is not interested in the details.
   SseResponse *sse_response = nullptr;
 };
 
@@ -282,7 +295,7 @@ struct ObjectUploadOptions {
 // final response against that snapshot.
 struct MultipartUploadOptions {
   // inputs
-  std::optional<SseOptions> sse;
+  OptValue<SseOptions> sse;
 
   // outputs
   SseResponse *sse_response = nullptr;
@@ -412,14 +425,8 @@ class Client : public Object {
                           std::string_view dst_object,
                           ObjectCopyOptions& opts) = 0;
 
-  virtual int init_multipart_upload(std::string_view object, void** context,
-                                    MultipartUploadOptions& opts) = 0;
-
-  // Convenience overload: forwards with an empty policy.
-  int init_multipart_upload(std::string_view object, void** context) {
-    MultipartUploadOptions opts;
-    return init_multipart_upload(object, context, opts);
-  }
+  virtual int init_multipart_upload(std::string_view object,
+                                    void** context) = 0;
 
   // return value is the part size if the operation succeeds, otherwise
   // return -1.
@@ -530,6 +537,15 @@ class Client : public Object {
   virtual int get_object_meta(std::string_view obj, ObjectMeta& meta) = 0;
 
   virtual void set_credentials(CredentialParameters&& credentials) = 0;
+
+  // Extended multipart init with per-request options. The default
+  // implementation keeps legacy derivations source-compatible: an empty
+  // policy falls back to the two-argument interface; a present SSE policy
+  // is rejected with -1/EOPNOTSUPP instead of being silently dropped.
+  // `context` (when non-null) is always cleared and `opts.sse_response`
+  // (when non-null) is always reset before returning.
+  virtual int init_multipart_upload(std::string_view object, void** context,
+                                    MultipartUploadOptions& opts);
 };
 
 Client* new_oss_client(const ClientOptions& opt, Authenticator* auth);
