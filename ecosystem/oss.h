@@ -35,6 +35,96 @@ namespace objstore {
 
 using StringKV = ordered_string_kv;
 
+std::string_view lookup_mime_type(std::string_view name);
+
+static constexpr int OSS_MAX_PATH_LEN = 1023;
+
+// IP version used to resolve the endpoint / proxy hostname, enforced via a
+// private (client-owned) resolver on the underlying HTTP client.
+enum class IPVersion : uint8_t {
+  kBoth = 0,      // accept both IPv4 and IPv6 (default)
+  kIPv4Only = 1,  // discard IPv6 addresses
+  kIPv6Only = 2,  // discard IPv4 addresses
+};
+
+struct ClientOptions {
+  std::string endpoint;
+  std::string bucket;
+  std::string region;
+  std::string proxy;
+  int max_list_ret_cnt = 1000;
+  std::string user_agent = "Photon-ObjStore-Client";
+  std::string bind_ips;
+  // use path-style requests: http(s)://endpoint/bucket/object, instead of
+  // the virtual-hosted style http(s)://bucket.endpoint/object
+  bool path_style = false;
+  uint64_t request_timeout_us = 60ull * 1000 * 1000;
+  // Max idle time in microseconds before the underlying HTTP client closes a
+  // pooled connection; -1ULL keeps it until the peer closes it.
+  uint64_t connection_idle_expiration_us = -1ULL;
+  int retry_times = 2;
+
+  // When the request timeouts or encounters 5xx error, we will
+  // retry the request with times of the base interval.
+  // For QPSLimit case, the policy is different. We will retry more
+  // times until we have waited the "request time out" period.
+  uint64_t retry_base_interval_us = 100'000;
+  std::vector<std::pair<std::string, std::string>> custom_headers;
+
+  IPVersion ip_version = IPVersion::kBoth;
+};
+
+struct ObjectMeta {
+  uint8_t flags = 0;
+
+  void reset() { flags = 0; }
+
+#define DEFINE_OPTIONAL_FIELD(type, name, flag)                  \
+  static_assert((flag) > 0 && ((flag) & ((flag) - 1)) == 0,      \
+                "Flag must be a power of two");                  \
+  static_assert(((flag) & ~((uint8_t)0xFF)) == 0,                \
+                "Flag must fit within uint8_t bit range (0-7)"); \
+  type name{};                                                   \
+  bool has_##name() const { return flags & (flag); }             \
+  void set_##name() { flags |= (flag); }                         \
+  void set_##name(const type& value) {                           \
+    name = value;                                                \
+    flags |= (flag);                                             \
+  }                                                              \
+  void reset_##name() {                                          \
+    name = {};                                                   \
+    flags &= ~(flag);                                            \
+  }
+
+  DEFINE_OPTIONAL_FIELD(size_t, size, 1)
+  DEFINE_OPTIONAL_FIELD(time_t, mtime, 1 << 1)
+  DEFINE_OPTIONAL_FIELD(std::string, etag, 1 << 2)
+  DEFINE_OPTIONAL_FIELD(std::string, type, 1 << 3)  // Appendable/Normal/...
+};
+
+struct RequestTrace {
+  std::string request_id;       // x-oss-request-id, empty if server unreached
+  int http_code = 0;            // HTTP status code, 0 if server unreached
+
+  uint64_t server_time_ms = 0;  // x-oss-server-time
+  uint64_t qos_delay_ms = 0;    // x-oss-qos-delay-time, server-side QoS delay
+
+  bool throttled = false;       // HTTP 429 / QPS limit exceeded
+  uint64_t retry_after_ms = 0;  // Retry-After header, 0 if absent
+
+  int attempts = 0;             // requests sent, including retries
+
+  void reset() {
+    request_id.clear();
+    http_code = 0;
+    server_time_ms = 0;
+    qos_delay_ms = 0;
+    throttled = false;
+    retry_after_ms = 0;
+    attempts = 0;
+  }
+};
+
 // A simple optional-value holder used by the OSS object model. It predates
 // the SSE model below and must stay C++14-compatible: no std::optional, no
 // throwing accessors. Check has_value()/operator bool() before value().
@@ -110,73 +200,6 @@ SseVerification verify_sse_response(const SseOptions& expected,
                                     bool require_kms_key_id,
                                     SseResponse* observed);
 
-std::string_view lookup_mime_type(std::string_view name);
-
-static constexpr int OSS_MAX_PATH_LEN = 1023;
-
-// IP version used to resolve the endpoint / proxy hostname, enforced via a
-// private (client-owned) resolver on the underlying HTTP client.
-enum class IPVersion : uint8_t {
-  kBoth = 0,      // accept both IPv4 and IPv6 (default)
-  kIPv4Only = 1,  // discard IPv6 addresses
-  kIPv6Only = 2,  // discard IPv4 addresses
-};
-
-struct ClientOptions {
-  std::string endpoint;
-  std::string bucket;
-  std::string region;
-  std::string proxy;
-  int max_list_ret_cnt = 1000;
-  std::string user_agent = "Photon-ObjStore-Client";
-  std::string bind_ips;
-  // use path-style requests: http(s)://endpoint/bucket/object, instead of
-  // the virtual-hosted style http(s)://bucket.endpoint/object
-  bool path_style = false;
-  uint64_t request_timeout_us = 60ull * 1000 * 1000;
-  // Max idle time in microseconds before the underlying HTTP client closes a
-  // pooled connection; -1ULL keeps it until the peer closes it.
-  uint64_t connection_idle_expiration_us = -1ULL;
-  int retry_times = 2;
-
-  // When the request timeouts or encounters 5xx error, we will
-  // retry the request with times of the base interval.
-  // For QPSLimit case, the policy is different. We will retry more
-  // times until we have waited the "request time out" period.
-  uint64_t retry_base_interval_us = 100'000;
-  std::vector<std::pair<std::string, std::string>> custom_headers;
-
-  IPVersion ip_version = IPVersion::kBoth;
-};
-
-struct ObjectMeta {
-  uint8_t flags = 0;
-
-  void reset() { flags = 0; }
-
-#define DEFINE_OPTIONAL_FIELD(type, name, flag)                  \
-  static_assert((flag) > 0 && ((flag) & ((flag) - 1)) == 0,      \
-                "Flag must be a power of two");                  \
-  static_assert(((flag) & ~((uint8_t)0xFF)) == 0,                \
-                "Flag must fit within uint8_t bit range (0-7)"); \
-  type name{};                                                   \
-  bool has_##name() const { return flags & (flag); }             \
-  void set_##name() { flags |= (flag); }                         \
-  void set_##name(const type& value) {                           \
-    name = value;                                                \
-    flags |= (flag);                                             \
-  }                                                              \
-  void reset_##name() {                                          \
-    name = {};                                                   \
-    flags &= ~(flag);                                            \
-  }
-
-  DEFINE_OPTIONAL_FIELD(size_t, size, 1)
-  DEFINE_OPTIONAL_FIELD(time_t, mtime, 1 << 1)
-  DEFINE_OPTIONAL_FIELD(std::string, etag, 1 << 2)
-  DEFINE_OPTIONAL_FIELD(std::string, type, 1 << 3)  // Appendable/Normal/...
-};
-
 struct ObjectHeaderMeta : public ObjectMeta {
   DEFINE_OPTIONAL_FIELD(std::string, storage_class, 1 << 4)
   DEFINE_OPTIONAL_FIELD(uint64_t, crc64, 1 << 5)
@@ -186,29 +209,6 @@ struct ObjectHeaderMeta : public ObjectMeta {
   // SSE attributes observed on HEAD. Independent field (not squeezed into
   // the uint8 flags); only meaningful as a transient HEAD result.
   SseResponse sse;
-};
-
-struct RequestTrace {
-  std::string request_id;       // x-oss-request-id, empty if server unreached
-  int http_code = 0;            // HTTP status code, 0 if server unreached
-
-  uint64_t server_time_ms = 0;  // x-oss-server-time
-  uint64_t qos_delay_ms = 0;    // x-oss-qos-delay-time, server-side QoS delay
-
-  bool throttled = false;       // HTTP 429 / QPS limit exceeded
-  uint64_t retry_after_ms = 0;  // Retry-After header, 0 if absent
-
-  int attempts = 0;             // requests sent, including retries
-
-  void reset() {
-    request_id.clear();
-    http_code = 0;
-    server_time_ms = 0;
-    qos_delay_ms = 0;
-    throttled = false;
-    retry_after_ms = 0;
-    attempts = 0;
-  }
 };
 
 struct ObjectCopyOptions {
