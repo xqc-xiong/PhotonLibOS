@@ -125,9 +125,6 @@ struct RequestTrace {
   }
 };
 
-// A simple optional-value holder used by the OSS object model. It predates
-// the SSE model below and must stay C++14-compatible: no std::optional, no
-// throwing accessors. Check has_value()/operator bool() before value().
 template <typename T>
 class OptValue {
  public:
@@ -148,32 +145,23 @@ class OptValue {
   bool has_value_ = false;
 };
 
-// ---------------------------------------------------------------------------
-// Server-side encryption (SSE) request/response model
-//
-// SseOptions is the typed, per-request SSE policy. It is only honored by the
-// object-creation APIs (PutObject / InitiateMultipartUpload / CopyObject) and
-// is applied right before signing so the headers participate in the
-// signature. All other APIs reject a non-empty SseOptions input.
+// Accepted by PutObject, CopyObject and multipart Init only.
 struct SseOptions {
   std::string algorithm;   // e.g. "AES256", "KMS"
   std::string kms_key_id;  // optional CMK id for the KMS algorithm
 };
 
-// SSE-related fields observed on a single response. All strings are copied
-// out of the HTTP header buffer; no string_view is retained.
-// These are observations; callers own verification against their policy.
+// Observed SSE attributes; policy verification belongs to the caller.
 struct SseResponse {
   OptValue<std::string> algorithm;
   OptValue<std::string> kms_key_id;
-  // x-oss-server-side-data-encryption, e.g. AES256/SM4 for KMS objects.
+  // x-oss-server-side-data-encryption, distinct from the SSE mode.
   OptValue<std::string> data_algorithm;
   std::string request_id;
   // A successful OSS business response was parsed, even without SSE fields.
   bool received = false;
 };
 
-// Extract SSE-related response headers into `out` (fully reset first).
 void parse_sse_response(const photon::net::http::Headers& headers,
                         SseResponse* out);
 
@@ -183,8 +171,6 @@ struct ObjectHeaderMeta : public ObjectMeta {
 
 #undef DEFINE_OPTIONAL_FIELD
 
-  // SSE attributes observed on HEAD. Independent field (not squeezed into
-  // the uint8 flags); only meaningful as a transient HEAD result.
   SseResponse sse;
 
   void reset() {
@@ -199,13 +185,9 @@ struct ObjectCopyOptions {
 
   OptValue<uint64_t> crc64;
 
-  // inputs
-  // Effective SSE policy for the destination object. OSS does not inherit
-  // SSE attributes from the copy source, so the caller must pass an explicit
-  // policy when encryption is expected.
+  // CopyObject does not inherit the source encryption policy.
   OptValue<SseOptions> sse;
-  // Optional x-oss-copy-source-if-match constraint (source ETag), used to
-  // bind the HEAD-based policy decision to the copied content.
+  // x-oss-copy-source-if-match.
   std::string source_if_match;
 
   // outputs
@@ -283,26 +265,16 @@ struct ObjectUploadOptions {
   // outputs
   std::string *etag = nullptr;
 
-  // inputs (appended after the historical members so existing aggregate
-  // initializations like {&crc64, &etag} keep compiling)
-  // SSE creation policy. Only accepted by PutObject; UploadPart /
-  // AppendObject / CompleteMultipartUpload reject a present value (multipart
-  // encryption is fixed by OSS at Init time).
+  // Append new fields after crc64/etag for existing aggregate initializers.
+  // SSE input is accepted only by PutObject.
   OptValue<SseOptions> sse;
 
-  // outputs
-  // Optional observation of response SSE attributes. nullptr discards them;
-  // Photon never compares the response with the requested encryption policy.
   SseResponse *sse_response = nullptr;
 };
 
-// Options for InitiateMultipartUpload. OSS fixes encryption at Init time.
-// Callers requiring strict verification must retain their own policy snapshot.
+// OSS fixes encryption at Init; callers retain their verification policy.
 struct MultipartUploadOptions {
-  // inputs
   OptValue<SseOptions> sse;
-
-  // outputs
   SseResponse *sse_response = nullptr;
 };
 
@@ -557,14 +529,9 @@ class Client : public Object {
 
   virtual void set_credentials(CredentialParameters&& credentials) = 0;
 
-  // Extended multipart init with per-request options. The default
-  // implementation keeps legacy derivations source-compatible: an empty
-  // policy falls back to the two-argument interface; a present SSE policy
-  // is rejected with -1/EOPNOTSUPP instead of being silently dropped.
-  // A valid `context` output slot is required and is cleared at entry.
-  // `opts.sse_response` is reset before returning and holds observations only.
-  // Complete/Abort consume a valid context on every outcome; callers must
-  // finish all Part operations first and must never reuse a consumed context.
+  // Legacy implementations fall back without SSE, otherwise return EOPNOTSUPP.
+  // Requires a valid context output. Complete/Abort consume context on every
+  // outcome; all Part operations must finish first.
   virtual int init_multipart_upload(std::string_view object, void** context,
                                     MultipartUploadOptions& opts);
 };

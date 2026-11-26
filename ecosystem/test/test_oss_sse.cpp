@@ -1,6 +1,4 @@
-// Offline tests for the OSS SSE request/response model, against a loopback
-// HTTP server and a recording authenticator (no credentials, no external
-// network). Scope: safe request encoding and response observations only.
+// Offline SSE tests using loopback HTTP and a recording authenticator.
 
 #include "../../test/gtest.h"
 
@@ -36,8 +34,6 @@ SseOptions aes() {
 }
 }  // namespace
 
-// Pure helpers (no photon runtime).
-
 TEST(OssSseHelpers, opt_value_and_legacy_aggregate_init) {
   OptValue<std::string> v;
   EXPECT_FALSE(v.has_value());
@@ -45,7 +41,7 @@ TEST(OssSseHelpers, opt_value_and_legacy_aggregate_init) {
   EXPECT_EQ(v.value(), "a");
   OptValue<std::string> copy = v;
   EXPECT_EQ(copy.value(), "a");
-  v.set(std::string());  // present-but-empty stays distinct from missing
+  v.set(std::string());
   EXPECT_TRUE(v.has_value());
   v.reset();
   EXPECT_FALSE(v.has_value());
@@ -88,8 +84,6 @@ TEST(OssSseHelpers, response_fields_preserve_presence_and_own_values) {
   EXPECT_FALSE(meta.sse.received);
   EXPECT_FALSE(meta.sse.kms_key_id.has_value());
 }
-
-// Loopback HTTP fixture.
 
 struct ScriptedResponse {
   int status = 200;
@@ -216,8 +210,6 @@ class OssSseHttpTest : public ::testing::Test {
   }
 };
 
-// Main flows of the SSE fix.
-
 TEST_F(OssSseHttpTest, put_sends_headers_and_observes_response) {
   script = {ok200("", "KMS", "key-1")};
   RecordingAuthenticator* auth;
@@ -231,7 +223,6 @@ TEST_F(OssSseHttpTest, put_sends_headers_and_observes_response) {
   ASSERT_EQ(requests.size(), 1u);
   EXPECT_EQ(requests[0]["x-oss-server-side-encryption"], "KMS");
   EXPECT_EQ(requests[0]["x-oss-server-side-encryption-key-id"], "key-1");
-  // The SSE headers were already present at signing time.
   EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption"], "KMS");
   EXPECT_TRUE(out.received);
   EXPECT_EQ(out.algorithm.value(), "KMS");
@@ -243,8 +234,6 @@ TEST_F(OssSseHttpTest, put_missing_echo_succeeds_with_and_without_output) {
   RecordingAuthenticator* auth;
   auto client = make_client(&auth);
   DEFER(delete client);
-  // Missing SSE fields do not turn a successful business response into
-  // an error. The caller owns strict verification, with or without output.
   ObjectUploadOptions a;
   a.sse.set(aes());
   errno = 0;
@@ -263,11 +252,13 @@ TEST_F(OssSseHttpTest, put_rejects_invalid_policy_and_conflicting_headers) {
   RecordingAuthenticator* auth;
   auto client = make_client(&auth);
   DEFER(delete client);
-  SseOptions bad[3];
-  bad[0].algorithm = "";  // present-but-empty is not "not requested"
+  SseOptions bad[5];
+  bad[0].algorithm = "";
   bad[1].algorithm = "SM4";
   bad[2] = aes();
-  bad[2].kms_key_id = "k";  // key id is only valid with KMS
+  bad[2].kms_key_id = "k";
+  bad[3].algorithm = "kms";
+  bad[4].algorithm = "aes256";
   for (const auto& p : bad) {
     ObjectUploadOptions o;
     o.sse.set(p);
@@ -277,7 +268,6 @@ TEST_F(OssSseHttpTest, put_rejects_invalid_policy_and_conflicting_headers) {
   }
   EXPECT_EQ(auth->sign_count, 0);
 
-  // A typed policy mixed with a global SSE custom header is rejected too.
   RecordingAuthenticator* auth2;
   auto client2 = make_client(&auth2, {{"x-oss-server-side-encryption", "KMS"}});
   DEFER(delete client2);
@@ -306,7 +296,6 @@ TEST_F(OssSseHttpTest, copy_sends_policy_and_source_if_match) {
   EXPECT_EQ(requests[0]["x-oss-server-side-encryption"], "AES256");
   EXPECT_TRUE(out.received);
   EXPECT_EQ(out.algorithm.value(), "AES256");
-  // Without an output pointer or echo, business success remains success.
   ObjectCopyOptions opts2;
   opts2.sse.set(aes());
   errno = 0;
@@ -325,7 +314,6 @@ TEST_F(OssSseHttpTest, multipart_sends_creation_headers_only_at_init) {
   ASSERT_NE(ctx, nullptr);
   ASSERT_EQ(requests.size(), 1u);
   EXPECT_EQ(requests[0]["x-oss-server-side-encryption"], "KMS");
-  // The service fixed encryption at Init; Complete does not resend a policy.
   mpu.sse.set(kms("key-9"));
   char data[4] = {0};
   iovec iov{data, sizeof(data)};
@@ -339,7 +327,6 @@ TEST_F(OssSseHttpTest, multipart_sends_creation_headers_only_at_init) {
   EXPECT_TRUE(out.received);
   EXPECT_EQ(out.algorithm.value(), "KMS");
   EXPECT_EQ(out.kms_key_id.value(), "key-1");
-  // Part and Complete must not carry SSE creation headers.
   ASSERT_EQ(requests.size(), 3u);
   EXPECT_EQ(requests[1].count("x-oss-server-side-encryption"), 0u);
   EXPECT_EQ(requests[2].count("x-oss-server-side-encryption"), 0u);
@@ -402,8 +389,7 @@ TEST_F(OssSseHttpTest, multipart_misuse_rejected) {
   EXPECT_EQ(client->abort_multipart_upload(ctx), 0);
   EXPECT_EQ(requests.size(), 2u);
 
-  // Complete with any caller-provided policy is a usage error, rejected
-  // without sending anything (and this one consumes its context).
+  // Rejected Complete still consumes context.
   void* ctx2 = nullptr;
   ASSERT_EQ(client->init_multipart_upload("mp-obj", &ctx2, mpu), 0);
   ObjectUploadOptions copts;
@@ -646,4 +632,39 @@ TEST(OssSseHelpers, legacy_init_falls_back_without_dropping_requested_sse) {
   EXPECT_EQ(ctx, nullptr);
   EXPECT_EQ(legacy.init_calls, 1);
   EXPECT_FALSE(observed.received);
+}
+
+TEST_F(OssSseHttpTest, header_conflicts_preserve_case_and_prefix_boundaries) {
+  for (const auto* name : {"X-OSS-SERVER-SIDE-ENCRYPTION", "x-Oss-server-side-encryption-Key-Id",
+                           "X-OSS-SERVER-SIDE-DATA-ENCRYPTION", "x-oss-server-side-encryption-context"}) {
+    RecordingAuthenticator* auth;
+    auto client = make_client(&auth, {{name, "value"}});
+    DEFER(delete client);
+    ObjectUploadOptions opts;
+    opts.sse.set(kms());
+    EXPECT_EQ(do_put(client, opts), -1);
+    EXPECT_EQ(errno, EINVAL);
+    EXPECT_EQ(auth->sign_count, 0);
+  }
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth, {{"X-OSS-COPY-SOURCE-IF-MATCH", "etag"}});
+  DEFER(delete client);
+  ObjectCopyOptions copy;
+  copy.source_if_match = "etag";
+  EXPECT_EQ(client->copy_object("src", "dst", copy), -1);
+  EXPECT_EQ(errno, EINVAL);
+  EXPECT_EQ(auth->sign_count, 0);
+  EXPECT_TRUE(requests.empty());
+
+  script = {ok200("", "KMS", "key-1")};
+  for (const auto* name : {"x", "x-oss-server-side-encryptio", "x-oss-server-side-encryptionx"}) {
+    RecordingAuthenticator* allowed_auth;
+    auto allowed = make_client(&allowed_auth, {{name, "value"}});
+    DEFER(delete allowed);
+    ObjectUploadOptions opts;
+    opts.sse.set(kms());
+    EXPECT_EQ(do_put(allowed, opts), 1);
+    EXPECT_EQ(allowed_auth->sign_count, 1);
+  }
+  EXPECT_EQ(requests.size(), 3u);
 }
