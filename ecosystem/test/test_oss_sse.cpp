@@ -1,6 +1,6 @@
 // Offline tests for the OSS SSE request/response model, against a loopback
 // HTTP server and a recording authenticator (no credentials, no external
-// network). Scope: the main flows of the SSE fix.
+// network). Scope: safe request encoding and response observations only.
 
 #include "../../test/gtest.h"
 
@@ -60,33 +60,33 @@ TEST(OssSseHelpers, opt_value_and_legacy_aggregate_init) {
   EXPECT_EQ(o.sse_response, nullptr);
 }
 
-TEST(OssSseHelpers, sse_header_and_verify_helpers) {
+TEST(OssSseHelpers, response_fields_preserve_presence_and_own_values) {
   CommonHeaders<4096> h;
-  EXPECT_EQ(add_sse_headers(h, kms()), 0);
-  EXPECT_EQ(h.get_value("x-oss-server-side-encryption"), "KMS");
-  EXPECT_EQ(h.get_value("x-oss-server-side-encryption-key-id"), "key-1");
-  errno = 0;  // duplicate insert is reported, not ignored
-  EXPECT_EQ(add_sse_headers(h, kms()), -1);
-  EXPECT_EQ(errno, EEXIST);
-  CommonHeaders<32> tiny;
-  errno = 0;  // out-of-buffer is reported, not silently dropped
-  EXPECT_EQ(add_sse_headers(tiny, aes()), -1);
-  EXPECT_EQ(errno, ENOBUFS);
-
+  h.insert("x-oss-server-side-encryption", "KMS");
+  h.insert("x-oss-server-side-encryption-key-id", "key-1");
+  h.insert("x-oss-server-side-data-encryption", "AES256");
+  h.insert("x-oss-request-id", "request-1");
   SseResponse out;
   parse_sse_response(h, &out);
+  EXPECT_TRUE(out.received);
+  ASSERT_TRUE(out.algorithm.has_value());
   EXPECT_EQ(out.algorithm.value(), "KMS");
   EXPECT_EQ(out.kms_key_id.value(), "key-1");
-  EXPECT_EQ(verify_sse_response(kms(), true, &out), SseVerification::Matched);
-  EXPECT_EQ(verify_sse_response(kms("key-2"), true, &out),
-            SseVerification::Mismatch);
-  CommonHeaders<4096> no_key;
-  no_key.insert("x-oss-server-side-encryption", "KMS");
-  SseResponse out2;
-  parse_sse_response(no_key, &out2);
-  // A missing key-id echo is tolerated at Init but rejected on final writes.
-  EXPECT_EQ(verify_sse_response(kms(), false, &out2), SseVerification::Matched);
-  EXPECT_EQ(verify_sse_response(kms(), true, &out2), SseVerification::Missing);
+  EXPECT_EQ(out.data_algorithm.value(), "AES256");
+  EXPECT_EQ(out.request_id, "request-1");
+  h.reset();
+  EXPECT_EQ(out.kms_key_id.value(), "key-1");
+  h.insert("x-oss-server-side-encryption-key-id", "");
+  parse_sse_response(h, &out);
+  EXPECT_TRUE(out.received);
+  EXPECT_FALSE(out.algorithm.has_value());
+  EXPECT_TRUE(out.kms_key_id.has_value());
+  EXPECT_TRUE(out.kms_key_id.value().empty());
+  ObjectHeaderMeta meta;
+  meta.sse = out;
+  meta.reset();
+  EXPECT_FALSE(meta.sse.received);
+  EXPECT_FALSE(meta.sse.kms_key_id.has_value());
 }
 
 // Loopback HTTP fixture.
@@ -198,7 +198,8 @@ class OssSseHttpTest : public ::testing::Test {
   photon::objstore::Client* make_client(RecordingAuthenticator** auth_out,
                                         CustomHeaders custom = {}) {
     ClientOptions opts;
-    opts.endpoint = "oss-test.example.com";
+    // The loopback fixture is plain HTTP, not a CONNECT/TLS proxy.
+    opts.endpoint = "http://oss-test.example.com";
     opts.bucket = "test-bucket";
     opts.proxy = estring().appends("http://127.0.0.1:",
                                    tcp_server->getsockname().port);
@@ -217,7 +218,7 @@ class OssSseHttpTest : public ::testing::Test {
 
 // Main flows of the SSE fix.
 
-TEST_F(OssSseHttpTest, put_sends_headers_and_verifies_match) {
+TEST_F(OssSseHttpTest, put_sends_headers_and_observes_response) {
   script = {ok200("", "KMS", "key-1")};
   RecordingAuthenticator* auth;
   auto client = make_client(&auth);
@@ -232,27 +233,29 @@ TEST_F(OssSseHttpTest, put_sends_headers_and_verifies_match) {
   EXPECT_EQ(requests[0]["x-oss-server-side-encryption-key-id"], "key-1");
   // The SSE headers were already present at signing time.
   EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption"], "KMS");
-  EXPECT_EQ(out.verification, SseVerification::Matched);
+  EXPECT_TRUE(out.received);
+  EXPECT_EQ(out.algorithm.value(), "KMS");
+  EXPECT_EQ(out.kms_key_id.value(), "key-1");
 }
 
-TEST_F(OssSseHttpTest, put_missing_echo_fails_with_and_without_output) {
+TEST_F(OssSseHttpTest, put_missing_echo_succeeds_with_and_without_output) {
   script = {ok200(), ok200()};
   RecordingAuthenticator* auth;
   auto client = make_client(&auth);
   DEFER(delete client);
-  // A null sse_response only means "not interested in details"; the
-  // verification still runs and fails the write.
+  // Missing SSE fields do not turn a successful business response into
+  // an error. The caller owns strict verification, with or without output.
   ObjectUploadOptions a;
   a.sse.set(aes());
   errno = 0;
-  EXPECT_EQ(do_put(client, a), -1);
-  EXPECT_EQ(errno, EIO);
+  EXPECT_EQ(do_put(client, a), 1);
   ObjectUploadOptions b;
   b.sse.set(aes());
   SseResponse out;
   b.sse_response = &out;
-  EXPECT_EQ(do_put(client, b), -1);
-  EXPECT_EQ(out.verification, SseVerification::Missing);
+  EXPECT_EQ(do_put(client, b), 1);
+  EXPECT_TRUE(out.received);
+  EXPECT_FALSE(out.algorithm.has_value());
   EXPECT_EQ(requests.size(), 2u);
 }
 
@@ -301,16 +304,16 @@ TEST_F(OssSseHttpTest, copy_sends_policy_and_source_if_match) {
   ASSERT_EQ(requests.size(), 1u);
   EXPECT_EQ(requests[0]["x-oss-copy-source-if-match"], "etag-src");
   EXPECT_EQ(requests[0]["x-oss-server-side-encryption"], "AES256");
-  EXPECT_EQ(out.verification, SseVerification::Matched);
-  // Same call without an output pointer and without an SSE echo: fails.
+  EXPECT_TRUE(out.received);
+  EXPECT_EQ(out.algorithm.value(), "AES256");
+  // Without an output pointer or echo, business success remains success.
   ObjectCopyOptions opts2;
   opts2.sse.set(aes());
   errno = 0;
-  EXPECT_EQ(client->copy_object("src-obj", "dst-obj", opts2), -1);
-  EXPECT_EQ(errno, EIO);
+  EXPECT_EQ(client->copy_object("src-obj", "dst-obj", opts2), 0);
 }
 
-TEST_F(OssSseHttpTest, multipart_init_snapshot_and_part_rules) {
+TEST_F(OssSseHttpTest, multipart_sends_creation_headers_only_at_init) {
   script = {ok200(kInitXml, "KMS"), ok200(), ok200(kCompleteXml, "KMS", "key-1")};
   RecordingAuthenticator* auth;
   auto client = make_client(&auth);
@@ -322,7 +325,7 @@ TEST_F(OssSseHttpTest, multipart_init_snapshot_and_part_rules) {
   ASSERT_NE(ctx, nullptr);
   ASSERT_EQ(requests.size(), 1u);
   EXPECT_EQ(requests[0]["x-oss-server-side-encryption"], "KMS");
-  // Mutating the caller's options after Init must not change the policy.
+  // The service fixed encryption at Init; Complete does not resend a policy.
   mpu.sse.set(kms("key-9"));
   char data[4] = {0};
   iovec iov{data, sizeof(data)};
@@ -333,14 +336,16 @@ TEST_F(OssSseHttpTest, multipart_init_snapshot_and_part_rules) {
   SseResponse out;
   copts.sse_response = &out;
   EXPECT_EQ(client->complete_multipart_upload(ctx, copts), 0);
-  EXPECT_EQ(out.verification, SseVerification::Matched);
+  EXPECT_TRUE(out.received);
+  EXPECT_EQ(out.algorithm.value(), "KMS");
+  EXPECT_EQ(out.kms_key_id.value(), "key-1");
   // Part and Complete must not carry SSE creation headers.
   ASSERT_EQ(requests.size(), 3u);
   EXPECT_EQ(requests[1].count("x-oss-server-side-encryption"), 0u);
   EXPECT_EQ(requests[2].count("x-oss-server-side-encryption"), 0u);
 }
 
-TEST_F(OssSseHttpTest, init_wrong_echo_aborts_with_and_without_output) {
+TEST_F(OssSseHttpTest, init_wrong_echo_is_observed_and_caller_owns_abort) {
   script = {ok200(kInitXml, "AES256"), abort204(),
             ok200(kInitXml, "AES256"), abort204()};
   RecordingAuthenticator* auth;
@@ -351,16 +356,20 @@ TEST_F(OssSseHttpTest, init_wrong_echo_aborts_with_and_without_output) {
   SseResponse out;
   m1.sse_response = &out;
   void* ctx = nullptr;
-  errno = 0;
-  EXPECT_EQ(client->init_multipart_upload("mp-obj", &ctx, m1), -1);
-  EXPECT_EQ(errno, EIO);
-  EXPECT_EQ(ctx, nullptr);
-  EXPECT_EQ(out.verification, SseVerification::Mismatch);
-  MultipartUploadOptions m2;  // no output pointer: same cleanup
+  EXPECT_EQ(client->init_multipart_upload("mp-obj", &ctx, m1), 0);
+  ASSERT_NE(ctx, nullptr);
+  EXPECT_TRUE(out.received);
+  EXPECT_EQ(out.algorithm.value(), "AES256");
+  EXPECT_EQ(requests.size(), 1u);
+  EXPECT_EQ(client->abort_multipart_upload(ctx), 0);
+  ctx = nullptr;
+  MultipartUploadOptions m2;
   m2.sse.set(kms());
-  EXPECT_EQ(client->init_multipart_upload("mp-obj", &ctx, m2), -1);
-  EXPECT_EQ(ctx, nullptr);
-  // Each failed Init is followed by a best-effort Abort (DELETE uploadId).
+  EXPECT_EQ(client->init_multipart_upload("mp-obj", &ctx, m2), 0);
+  ASSERT_NE(ctx, nullptr);
+  EXPECT_EQ(requests.size(), 3u);
+  EXPECT_EQ(client->abort_multipart_upload(ctx), 0);
+  ctx = nullptr;
   ASSERT_EQ(targets.size(), 4u);
   EXPECT_NE(targets[1].find("U1"), std::string::npos);
   EXPECT_NE(targets[3].find("U1"), std::string::npos);
@@ -379,10 +388,16 @@ TEST_F(OssSseHttpTest, multipart_misuse_rejected) {
   iovec iov{data, sizeof(data)};
   ObjectUploadOptions popts;
   popts.sse.set(aes());
+  SseResponse out;
+  out.received = true;
+  popts.sse_response = &out;
   errno = 0;
   EXPECT_EQ(client->upload_part(ctx, &iov, 1, 1, popts), -1);
   EXPECT_EQ(errno, EINVAL);
+  EXPECT_FALSE(out.received);
+  out.received = true;
   EXPECT_EQ(client->append_object("a-obj", &iov, 1, 0, popts), -1);
+  EXPECT_FALSE(out.received);
   EXPECT_EQ(requests.size(), 1u);
   EXPECT_EQ(client->abort_multipart_upload(ctx), 0);
   EXPECT_EQ(requests.size(), 2u);
@@ -393,8 +408,242 @@ TEST_F(OssSseHttpTest, multipart_misuse_rejected) {
   ASSERT_EQ(client->init_multipart_upload("mp-obj", &ctx2, mpu), 0);
   ObjectUploadOptions copts;
   copts.sse.set(kms());
+  out.received = true;
+  copts.sse_response = &out;
+  std::string etag = "unchanged";
+  copts.etag = &etag;
   errno = 0;
   EXPECT_EQ(client->complete_multipart_upload(ctx2, copts), -1);
+  ctx2 = nullptr;
   EXPECT_EQ(errno, EINVAL);
+  EXPECT_FALSE(out.received);
+  EXPECT_EQ(etag, "unchanged");
   EXPECT_EQ(requests.size(), 3u);
+}
+
+TEST_F(OssSseHttpTest, header_capacity_and_control_chars_fail_before_send) {
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth);
+  DEFER(delete client);
+  int body_calls = 0;
+  auto writer = [&](IStream*) -> ssize_t {
+    ++body_calls;
+    return 1;
+  };
+  BodyWriter body = writer;
+  ObjectUploadOptions put;
+  auto huge = kms();
+  huge.kms_key_id = std::string(128 * 1024, 'k');
+  put.sse.set(huge);
+  SseResponse observed;
+  observed.received = true;
+  put.sse_response = &observed;
+  EXPECT_EQ(client->put_object("obj", 1, body, put), -1);
+  EXPECT_EQ(errno, ENOBUFS);
+  EXPECT_FALSE(observed.received);
+  MultipartUploadOptions init;
+  init.sse.set(huge);
+  void* ctx = nullptr;
+  EXPECT_EQ(client->init_multipart_upload("obj", &ctx, init), -1);
+  EXPECT_EQ(errno, ENOBUFS);
+  EXPECT_EQ(ctx, nullptr);
+  ObjectCopyOptions copy;
+  copy.source_if_match = std::string(128 * 1024, 'e');
+  EXPECT_EQ(client->copy_object("src", "dst", copy), -1);
+  EXPECT_EQ(errno, ENOBUFS);
+  copy.source_if_match = "etag\r\nInjected: value";
+  EXPECT_EQ(client->copy_object("src", "dst", copy), -1);
+  EXPECT_EQ(errno, EINVAL);
+  for (const auto& key : std::vector<std::string>{"key\r\nInjected: value", std::string("a\0b", 3)}) {
+    SseOptions invalid = kms();
+    invalid.kms_key_id = key;
+    put.sse.set(invalid);
+    EXPECT_EQ(client->put_object("obj", 1, body, put), -1);
+    EXPECT_EQ(errno, EINVAL);
+  }
+  EXPECT_EQ(auth->sign_count, 0);
+  EXPECT_EQ(body_calls, 0);
+  EXPECT_TRUE(requests.empty());
+}
+
+TEST_F(OssSseHttpTest, differing_response_is_returned_not_verified) {
+  script = {ok200("", "AES256"), ok200(kCopyXml, "KMS", "other-key"), ok200(kInitXml, "KMS", "key-1"),
+            ok200(kCompleteXml, "KMS", "other-key")};
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth);
+  DEFER(delete client);
+  SseResponse observed;
+  ObjectUploadOptions put;
+  put.sse.set(kms());
+  put.sse_response = &observed;
+  EXPECT_EQ(do_put(client, put), 1);
+  EXPECT_TRUE(observed.received);
+  EXPECT_EQ(observed.algorithm.value(), "AES256");
+  ObjectCopyOptions copy;
+  copy.sse.set(kms());
+  copy.sse_response = &observed;
+  EXPECT_EQ(client->copy_object("src", "dst", copy), 0);
+  EXPECT_EQ(observed.kms_key_id.value(), "other-key");
+  MultipartUploadOptions init;
+  init.sse.set(kms());
+  void* ctx = nullptr;
+  ASSERT_EQ(client->init_multipart_upload("obj", &ctx, init), 0);
+  ObjectUploadOptions complete;
+  complete.sse_response = &observed;
+  std::string etag;
+  complete.etag = &etag;
+  EXPECT_EQ(client->complete_multipart_upload(ctx, complete), 0);
+  ctx = nullptr;
+  EXPECT_TRUE(observed.received);
+  EXPECT_EQ(observed.kms_key_id.value(), "other-key");
+  EXPECT_EQ(etag, "\"e1\"");
+}
+
+TEST_F(OssSseHttpTest, complete_missing_echo_succeeds_without_observation) {
+  script = {ok200(kInitXml, "KMS"), ok200(kCompleteXml)};
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth);
+  DEFER(delete client);
+  MultipartUploadOptions init;
+  init.sse.set(kms());
+  void* ctx = nullptr;
+  ASSERT_EQ(client->init_multipart_upload("obj", &ctx, init), 0);
+  ObjectUploadOptions complete;
+  EXPECT_EQ(client->complete_multipart_upload(ctx, complete), 0);
+  ctx = nullptr;
+  EXPECT_EQ(requests.size(), 2u);
+}
+
+TEST_F(OssSseHttpTest, successful_response_remains_observable_on_crc_failure) {
+  auto response = ok200("", "KMS", "key-1");
+  response.headers["x-oss-hash-crc64ecma"] = "123";
+  auto completed = ok200(kCompleteXml, "KMS", "key-1");
+  completed.headers["x-oss-hash-crc64ecma"] = "123";
+  script = {response, ok200(kInitXml, "KMS", "key-1"), completed};
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth);
+  DEFER(delete client);
+  uint64_t expected_crc = 999;
+  std::string etag = "unchanged";
+  SseResponse observed;
+  ObjectUploadOptions put{&expected_crc, &etag};
+  put.sse.set(kms());
+  put.sse_response = &observed;
+  EXPECT_EQ(do_put(client, put), -1);
+  EXPECT_EQ(errno, EIO);
+  EXPECT_TRUE(observed.received);
+  EXPECT_EQ(observed.kms_key_id.value(), "key-1");
+  EXPECT_EQ(etag, "unchanged");
+  MultipartUploadOptions init;
+  init.sse.set(kms());
+  void* ctx = nullptr;
+  ASSERT_EQ(client->init_multipart_upload("obj", &ctx, init), 0);
+  ObjectUploadOptions complete{&expected_crc, &etag};
+  complete.sse_response = &observed;
+  EXPECT_EQ(client->complete_multipart_upload(ctx, complete), -1);
+  ctx = nullptr;
+  EXPECT_EQ(errno, EIO);
+  EXPECT_TRUE(observed.received);
+  EXPECT_EQ(etag, "unchanged");
+}
+
+TEST_F(OssSseHttpTest, business_errors_do_not_publish_success_observations) {
+  script = {ok200("<Error><Code>InternalError</Code></Error>"), ok200(kInitXml),
+            ok200("<Error><Code>InternalError</Code></Error>")};
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth);
+  DEFER(delete client);
+  SseResponse observed;
+  observed.received = true;
+  ObjectCopyOptions copy;
+  copy.sse.set(kms());
+  copy.sse_response = &observed;
+  EXPECT_EQ(client->copy_object("src", "dst", copy), -1);
+  EXPECT_EQ(errno, EIO);
+  EXPECT_FALSE(observed.received);
+  MultipartUploadOptions init;
+  void* ctx = nullptr;
+  ASSERT_EQ(client->init_multipart_upload("obj", &ctx, init), 0);
+  ObjectUploadOptions complete;
+  complete.sse_response = &observed;
+  observed.received = true;
+  EXPECT_EQ(client->complete_multipart_upload(ctx, complete), -1);
+  ctx = nullptr;
+  EXPECT_EQ(errno, EIO);
+  EXPECT_FALSE(observed.received);
+}
+
+TEST_F(OssSseHttpTest, kms_without_key_id_reports_service_selected_key) {
+  script = {ok200("", "KMS", "service-key")};
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth);
+  DEFER(delete client);
+  ObjectUploadOptions put;
+  put.sse.set(kms(""));
+  SseResponse observed;
+  put.sse_response = &observed;
+  EXPECT_EQ(do_put(client, put), 1);
+  ASSERT_EQ(requests.size(), 1u);
+  EXPECT_EQ(requests[0].count("x-oss-server-side-encryption-key-id"), 0u);
+  EXPECT_TRUE(observed.received);
+  EXPECT_EQ(observed.kms_key_id.value(), "service-key");
+}
+
+// An old-style consumer implements only the two-argument Init entry point.
+class LegacySseClient : public photon::objstore::Client {
+ public:
+  int init_calls = 0;
+  int put_bucket(std::string_view) override { return -1; }
+  int delete_bucket() override { return -1; }
+  int list_objects(std::string_view, ListObjectsCallback, ListObjectsParameters, std::string*, RequestTrace*) override {
+    return -1;
+  }
+  int head_object(std::string_view, ObjectHeaderMeta&, RequestTrace*) override { return -1; }
+  ssize_t get_object_range(std::string_view, off_t, size_t, BodyReader, ObjectHeaderMeta*, RequestTrace*) override {
+    return -1;
+  }
+  int get_object_ranges(std::string_view, std::vector<GetRangeParameters>&, RequestTrace*) override { return -1; }
+  int batch_get_objects(std::vector<GetObjectParameters>&, RequestTrace*) override { return -1; }
+  ssize_t put_object(std::string_view, size_t, BodyWriter, ObjectUploadOptions&, RequestTrace*) override { return -1; }
+  ssize_t append_object(std::string_view, const iovec*, int, off_t, ObjectUploadOptions&, RequestTrace*) override {
+    return -1;
+  }
+  int copy_object(std::string_view, std::string_view, ObjectCopyOptions&) override { return -1; }
+  int init_multipart_upload(std::string_view, void** ctx) override {
+    ++init_calls;
+    *ctx = this;
+    return 0;
+  }
+  ssize_t upload_part(void*, size_t, int, BodyWriter, ObjectUploadOptions&) override { return -1; }
+  int upload_part_copy(void*, off_t, size_t, int, std::string_view, ObjectPartCopyOptions&) override { return -1; }
+  int complete_multipart_upload(void*, ObjectUploadOptions&) override { return -1; }
+  int abort_multipart_upload(void*) override { return -1; }
+  int delete_objects(const std::vector<std::string_view>&, std::string_view) override { return -1; }
+  int delete_object(std::string_view) override { return -1; }
+  int rename_object(std::string_view, std::string_view, bool) override { return -1; }
+  int put_symlink(std::string_view, std::string_view) override { return -1; }
+  int get_symlink(std::string_view, std::string&) override { return -1; }
+  int get_object_meta(std::string_view, ObjectMeta&) override { return -1; }
+  void set_credentials(CredentialParameters&&) override {}
+};
+
+TEST(OssSseHelpers, legacy_init_falls_back_without_dropping_requested_sse) {
+  LegacySseClient legacy;
+  photon::objstore::Client& client = legacy;
+  MultipartUploadOptions init;
+  SseResponse observed;
+  observed.received = true;
+  init.sse_response = &observed;
+  void* ctx = nullptr;
+  EXPECT_EQ(client.init_multipart_upload("obj", &ctx, init), 0);
+  EXPECT_EQ(ctx, &legacy);
+  EXPECT_EQ(legacy.init_calls, 1);
+  EXPECT_FALSE(observed.received);
+  init.sse.set(kms());
+  observed.received = true;
+  EXPECT_EQ(client.init_multipart_upload("obj", &ctx, init), -1);
+  EXPECT_EQ(errno, EOPNOTSUPP);
+  EXPECT_EQ(ctx, nullptr);
+  EXPECT_EQ(legacy.init_calls, 1);
+  EXPECT_FALSE(observed.received);
 }
