@@ -157,7 +157,7 @@ struct SseResponse {
   OptValue<std::string> kms_key_id;
   // x-oss-server-side-data-encryption, distinct from the SSE mode.
   OptValue<std::string> data_algorithm;
-  std::string request_id;
+  OptValue<std::string> request_id;
   // A successful OSS business response was parsed, even without SSE fields.
   bool received = false;
 };

@@ -360,14 +360,6 @@ static const std::string_view kSseAlgorithmAES256 = "AES256";
 static const std::string_view kSseAlgorithmKMS = "KMS";
 static const std::string_view kForbiddenHeaderChars("\r\n\0", 3);
 
-static bool is_sse_header_name(std::string_view name) {
-  estring_view key(name);
-  if (key.istarts_with(kHeaderSSE)) {
-    return key.size() == kHeaderSSE.size() || key[kHeaderSSE.size()] == '-';
-  }
-  return key.icmp(kHeaderSSEDataAlgorithm) == 0;
-}
-
 static int validate_sse_options(const SseOptions& sse) {
   if (sse.algorithm.empty())
     LOG_ERROR_RETURN(EINVAL, -1, "SSE algorithm must not be empty");
@@ -407,34 +399,19 @@ static int add_sse_headers(photon::net::http::Headers& headers, const SseOptions
   return 0;
 }
 
-static int check_custom_headers_conflict(
-    const std::vector<std::pair<std::string, std::string>>& custom_headers,
-    const OptValue<SseOptions>& sse, bool check_source_if_match) {
-  for (const auto& kv : custom_headers) {
-    if (sse.has_value() && is_sse_header_name(kv.first))
-      LOG_ERROR_RETURN(EINVAL, -1, "SSE header conflict: `", kv.first);
-    if (check_source_if_match && estring_view(kv.first).icmp(kHeaderCopySourceIfMatch) == 0)
-      LOG_ERROR_RETURN(
-          EINVAL, -1,
-          "custom header ` conflicts with the explicit source_if_match",
-          kv.first);
-  }
-  return 0;
-}
-
 void parse_sse_response(const photon::net::http::Headers& headers,
                         SseResponse* out) {
   if (!out) return;
   *out = SseResponse{};
   out->received = true;
-  auto it = headers.find(kHeaderSSE);
-  if (it != headers.end()) out->algorithm.set(std::string(it.second()));
-  it = headers.find(kHeaderSSEKMSKeyId);
-  if (it != headers.end()) out->kms_key_id.set(std::string(it.second()));
-  it = headers.find(kHeaderSSEDataAlgorithm);
-  if (it != headers.end()) out->data_algorithm.set(std::string(it.second()));
-  it = headers.find(kHeaderRequestId);
-  if (it != headers.end()) out->request_id = std::string(it.second());
+  auto parse_field = [&](std::string_view name, OptValue<std::string>& field) {
+    auto it = headers.find(name);
+    if (it != headers.end()) field.set(std::string(it.second()));
+  };
+  parse_field(kHeaderSSE, out->algorithm);
+  parse_field(kHeaderSSEKMSKeyId, out->kms_key_id);
+  parse_field(kHeaderSSEDataAlgorithm, out->data_algorithm);
+  parse_field(kHeaderRequestId, out->request_id);
 }
 
 static ssize_t body_writer_cb(void* iov_view, photon::net::http::Request* req) {
@@ -869,9 +846,7 @@ int OssClient::do_copy_object(OssUrl& src_oss_url, OssUrl& dst_oss_url,
       estring_view(opts.source_if_match).find_first_of(kForbiddenHeaderChars) != std::string_view::npos)
     LOG_ERROR_RETURN(EINVAL, -1,
                      "source_if_match contains forbidden control characters");
-  int r = check_custom_headers_conflict(m_oss_options.custom_headers, opts.sse,
-                                        !opts.source_if_match.empty());
-  if (r < 0) return r;
+  int r = 0;
 
   DEFINE_ONSTACK_OP(m_client, Verb::PUT, dst_oss_url.url());
 
@@ -1746,9 +1721,7 @@ ssize_t OssClient::put_object(std::string_view object, size_t cnt,
     int r = validate_sse_options(opts.sse.value());
     if (r < 0) return r;
   }
-  int r = check_custom_headers_conflict(m_oss_options.custom_headers, opts.sse,
-                                        false);
-  if (r < 0) return r;
+  int r = 0;
 
   DEFINE_ONSTACK_OP(m_client, Verb::PUT, oss_url.url());
   if (!content_type.empty()) {
@@ -1836,9 +1809,7 @@ int OssClient::init_multipart_upload(std::string_view object, void** context,
     int r = validate_sse_options(opts.sse.value());
     if (r < 0) return r;
   }
-  int r = check_custom_headers_conflict(m_oss_options.custom_headers, opts.sse,
-                                        false);
-  if (r < 0) return r;
+  int r = 0;
 
   auto oss_url = make_oss_url(object);
 

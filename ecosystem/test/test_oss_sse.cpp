@@ -69,20 +69,28 @@ TEST(OssSseHelpers, response_fields_preserve_presence_and_own_values) {
   EXPECT_EQ(out.algorithm.value(), "KMS");
   EXPECT_EQ(out.kms_key_id.value(), "key-1");
   EXPECT_EQ(out.data_algorithm.value(), "AES256");
-  EXPECT_EQ(out.request_id, "request-1");
+  ASSERT_TRUE(out.request_id.has_value());
+  EXPECT_EQ(out.request_id.value(), "request-1");
   h.reset();
   EXPECT_EQ(out.kms_key_id.value(), "key-1");
+  EXPECT_EQ(out.request_id.value(), "request-1");
   h.insert("x-oss-server-side-encryption-key-id", "");
   parse_sse_response(h, &out);
   EXPECT_TRUE(out.received);
   EXPECT_FALSE(out.algorithm.has_value());
   EXPECT_TRUE(out.kms_key_id.has_value());
   EXPECT_TRUE(out.kms_key_id.value().empty());
+  EXPECT_FALSE(out.request_id.has_value());
+  h.insert("x-oss-request-id", "");
+  parse_sse_response(h, &out);
+  ASSERT_TRUE(out.request_id.has_value());
+  EXPECT_TRUE(out.request_id.value().empty());
   ObjectHeaderMeta meta;
   meta.sse = out;
   meta.reset();
   EXPECT_FALSE(meta.sse.received);
   EXPECT_FALSE(meta.sse.kms_key_id.has_value());
+  EXPECT_FALSE(meta.sse.request_id.has_value());
 }
 
 struct ScriptedResponse {
@@ -248,7 +256,7 @@ TEST_F(OssSseHttpTest, put_missing_echo_succeeds_with_and_without_output) {
   EXPECT_EQ(requests.size(), 2u);
 }
 
-TEST_F(OssSseHttpTest, put_rejects_invalid_policy_and_conflicting_headers) {
+TEST_F(OssSseHttpTest, put_rejects_invalid_policy) {
   RecordingAuthenticator* auth;
   auto client = make_client(&auth);
   DEFER(delete client);
@@ -268,15 +276,6 @@ TEST_F(OssSseHttpTest, put_rejects_invalid_policy_and_conflicting_headers) {
   }
   EXPECT_EQ(auth->sign_count, 0);
 
-  RecordingAuthenticator* auth2;
-  auto client2 = make_client(&auth2, {{"x-oss-server-side-encryption", "KMS"}});
-  DEFER(delete client2);
-  ObjectUploadOptions o;
-  o.sse.set(kms());
-  errno = 0;
-  EXPECT_EQ(do_put(client2, o), -1);
-  EXPECT_EQ(errno, EINVAL);
-  EXPECT_EQ(auth2->sign_count, 0);
   EXPECT_TRUE(requests.empty());
 }
 
@@ -634,37 +633,55 @@ TEST(OssSseHelpers, legacy_init_falls_back_without_dropping_requested_sse) {
   EXPECT_FALSE(observed.received);
 }
 
-TEST_F(OssSseHttpTest, header_conflicts_preserve_case_and_prefix_boundaries) {
-  for (const auto* name : {"X-OSS-SERVER-SIDE-ENCRYPTION", "x-Oss-server-side-encryption-Key-Id",
-                           "X-OSS-SERVER-SIDE-DATA-ENCRYPTION", "x-oss-server-side-encryption-context"}) {
-    RecordingAuthenticator* auth;
-    auto client = make_client(&auth, {{name, "value"}});
-    DEFER(delete client);
-    ObjectUploadOptions opts;
-    opts.sse.set(kms());
-    EXPECT_EQ(do_put(client, opts), -1);
-    EXPECT_EQ(errno, EINVAL);
-    EXPECT_EQ(auth->sign_count, 0);
-  }
+TEST_F(OssSseHttpTest, custom_headers_allow_mixing_and_preserve_existing_values) {
+  script = {ok200("", "KMS", "key-1"), ok200(kCopyXml, "KMS", "key-1"), ok200(kInitXml, "KMS", "key-1"), abort204()};
   RecordingAuthenticator* auth;
-  auto client = make_client(&auth, {{"X-OSS-COPY-SOURCE-IF-MATCH", "etag"}});
+  auto client = make_client(&auth, {{"X-OSS-SERVER-SIDE-ENCRYPTION", "AES256"},
+                                    {"x-oss-server-side-encryption-key-id", "custom-key"},
+                                    {"x-oss-server-side-encryption-context", "custom-context"},
+                                    {"X-OSS-SERVER-SIDE-DATA-ENCRYPTION", "AES256"},
+                                    {"X-OSS-COPY-SOURCE-IF-MATCH", "custom-etag"}});
   DEFER(delete client);
+  ObjectUploadOptions put;
+  put.sse.set(kms());
+  EXPECT_EQ(do_put(client, put), 1);
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption"], "KMS");
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption-key-id"], "key-1");
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption-context"], "custom-context");
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-data-encryption"], "AES256");
   ObjectCopyOptions copy;
-  copy.source_if_match = "etag";
-  EXPECT_EQ(client->copy_object("src", "dst", copy), -1);
-  EXPECT_EQ(errno, EINVAL);
-  EXPECT_EQ(auth->sign_count, 0);
-  EXPECT_TRUE(requests.empty());
+  copy.sse.set(kms());
+  copy.source_if_match = "source-etag";
+  EXPECT_EQ(client->copy_object("src", "dst", copy), 0);
+  EXPECT_EQ(auth->last_headers["x-oss-copy-source-if-match"], "source-etag");
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption"], "KMS");
+  MultipartUploadOptions init;
+  init.sse.set(kms());
+  void* ctx = nullptr;
+  ASSERT_EQ(client->init_multipart_upload("obj", &ctx, init), 0);
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption"], "KMS");
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption-key-id"], "key-1");
+  EXPECT_EQ(client->abort_multipart_upload(ctx), 0);
+  ctx = nullptr;
+  EXPECT_EQ(requests.size(), 4u);
+}
 
-  script = {ok200("", "KMS", "key-1")};
-  for (const auto* name : {"x", "x-oss-server-side-encryptio", "x-oss-server-side-encryptionx"}) {
-    RecordingAuthenticator* allowed_auth;
-    auto allowed = make_client(&allowed_auth, {{name, "value"}});
-    DEFER(delete allowed);
-    ObjectUploadOptions opts;
-    opts.sse.set(kms());
-    EXPECT_EQ(do_put(allowed, opts), 1);
-    EXPECT_EQ(allowed_auth->sign_count, 1);
-  }
-  EXPECT_EQ(requests.size(), 3u);
+TEST_F(OssSseHttpTest, custom_headers_supply_unspecified_values_without_filtering) {
+  script = {ok200("", "KMS", "first-key")};
+  RecordingAuthenticator* auth;
+  auto client = make_client(&auth, {{"x-oss-server-side-encryption-key-id", "first-key"},
+                                    {"X-OSS-SERVER-SIDE-ENCRYPTION-KEY-ID", "second-key"},
+                                    {"x-oss-server-side-encryption-context", "context"},
+                                    {"x-oss-server-side-encryptionx", "value"}});
+  DEFER(delete client);
+  ObjectUploadOptions put;
+  put.sse.set(kms(""));
+  SseResponse observed;
+  put.sse_response = &observed;
+  EXPECT_EQ(do_put(client, put), 1);
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption-key-id"], "first-key");
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryption-context"], "context");
+  EXPECT_EQ(auth->last_headers["x-oss-server-side-encryptionx"], "value");
+  EXPECT_TRUE(observed.received);
+  EXPECT_EQ(observed.kms_key_id.value(), "first-key");
 }
